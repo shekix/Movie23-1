@@ -1,0 +1,240 @@
+ Set up the RabbitMQ Docker Container
+Run the following command to pull and start the RabbitMQ Docker container:
+bash
+Copy
+Edit
+docker run -d --hostname rabbitmq --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:management
+Management UI is available at http://localhost:15672 (default user: guest, password: guest).
+3. Create the Order Microservice
+Step 1: Create a New Project
+bash
+Copy
+Edit
+dotnet new webapi -n OrderService
+cd OrderService
+Step 2: Add Required NuGet Packages
+bash
+Copy
+Edit
+dotnet add package RabbitMQ.Client
+Step 3: Implement RabbitMQ Publisher
+In the OrderService:
+
+Create a Services folder and add RabbitMQPublisher.cs:
+
+csharp
+Copy
+Edit
+using RabbitMQ.Client;
+using System.Text;
+
+public class RabbitMQPublisher
+{
+    private readonly IConnection _connection;
+    private readonly IModel _channel;
+
+    public RabbitMQPublisher()
+    {
+        var factory = new ConnectionFactory() { HostName = "localhost" };
+        _connection = factory.CreateConnection();
+        _channel = _connection.CreateModel();
+        _channel.QueueDeclare(queue: "OrderQueue", durable: false, exclusive: false, autoDelete: false, arguments: null);
+    }
+
+    public void Publish(string message)
+    {
+        var body = Encoding.UTF8.GetBytes(message);
+        _channel.BasicPublish(exchange: "", routingKey: "OrderQueue", basicProperties: null, body: body);
+    }
+}
+Register RabbitMQPublisher in Program.cs:
+
+csharp
+Copy
+Edit
+builder.Services.AddSingleton<RabbitMQPublisher>();
+Create an Order API Controller to publish messages:
+
+csharp
+Copy
+Edit
+using Microsoft.AspNetCore.Mvc;
+
+[ApiController]
+[Route("[controller]")]
+public class OrdersController : ControllerBase
+{
+    private readonly RabbitMQPublisher _publisher;
+
+    public OrdersController(RabbitMQPublisher publisher)
+    {
+        _publisher = publisher;
+    }
+
+    [HttpPost]
+    public IActionResult CreateOrder([FromBody] string orderDetails)
+    {
+        _publisher.Publish(orderDetails);
+        return Ok("Order placed successfully.");
+    }
+}
+4. Create the Notification Microservice
+Step 1: Create a New Project
+bash
+Copy
+Edit
+dotnet new worker -n NotificationService
+cd NotificationService
+Step 2: Add Required NuGet Packages
+bash
+Copy
+Edit
+dotnet add package RabbitMQ.Client
+dotnet add package MailKit
+dotnet add package MimeKit
+Step 3: Implement RabbitMQ Consumer
+Update Worker.cs to consume messages from RabbitMQ and send emails:
+csharp
+Copy
+Edit
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Hosting;
+using MimeKit;
+using MailKit.Net.Smtp;
+
+public class Worker : BackgroundService
+{
+    private readonly IConnection _connection;
+    private readonly IModel _channel;
+
+    public Worker()
+    {
+        var factory = new ConnectionFactory() { HostName = "localhost" };
+        _connection = factory.CreateConnection();
+        _channel = _connection.CreateModel();
+        _channel.QueueDeclare(queue: "OrderQueue", durable: false, exclusive: false, autoDelete: false, arguments: null);
+    }
+
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var consumer = new EventingBasicConsumer(_channel);
+        consumer.Received += async (model, ea) =>
+        {
+            var body = ea.Body.ToArray();
+            var message = Encoding.UTF8.GetString(body);
+
+            // Simulate email sending
+            await SendEmailAsync(message);
+        };
+
+        _channel.BasicConsume(queue: "OrderQueue", autoAck: true, consumer: consumer);
+        return Task.CompletedTask;
+    }
+
+    private async Task SendEmailAsync(string message)
+    {
+        var email = new MimeMessage();
+        email.From.Add(MailboxAddress.Parse("your-email@example.com"));
+        email.To.Add(MailboxAddress.Parse("recipient@example.com"));
+        email.Subject = "Order Notification";
+        email.Body = new TextPart("plain") { Text = $"New Order: {message}" };
+
+        using var smtp = new SmtpClient();
+        await smtp.ConnectAsync("smtp.mailtrap.io", 587, MailKit.Security.SecureSocketOptions.StartTls);
+        await smtp.AuthenticateAsync("username", "password");
+        await smtp.SendAsync(email);
+        await smtp.DisconnectAsync(true);
+    }
+}
+5. Dockerize Both Services
+Create Dockerfile for Order Service
+dockerfile
+Copy
+Edit
+# OrderService/Dockerfile
+FROM mcr.microsoft.com/dotnet/aspnet:6.0 AS base
+WORKDIR /app
+EXPOSE 80
+
+FROM mcr.microsoft.com/dotnet/sdk:6.0 AS build
+WORKDIR /src
+COPY . .
+RUN dotnet restore
+RUN dotnet publish -c Release -o /app
+
+FROM base AS final
+WORKDIR /app
+COPY --from=build /app .
+ENTRYPOINT ["dotnet", "OrderService.dll"]
+Create Dockerfile for Notification Service
+dockerfile
+Copy
+Edit
+# NotificationService/Dockerfile
+FROM mcr.microsoft.com/dotnet/aspnet:6.0 AS base
+WORKDIR /app
+EXPOSE 80
+
+FROM mcr.microsoft.com/dotnet/sdk:6.0 AS build
+WORKDIR /src
+COPY . .
+RUN dotnet restore
+RUN dotnet publish -c Release -o /app
+
+FROM base AS final
+WORKDIR /app
+COPY --from=build /app .
+ENTRYPOINT ["dotnet", "NotificationService.dll"]
+6. Run Using Docker Compose
+Create a docker-compose.yml file to run RabbitMQ, OrderService, and NotificationService:
+
+yaml
+Copy
+Edit
+version: '3.4'
+
+services:
+  rabbitmq:
+    image: rabbitmq:management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  orderservice:
+    build:
+      context: ./OrderService
+    ports:
+      - "5000:80"
+    depends_on:
+      - rabbitmq
+
+  notificationservice:
+    build:
+      context: ./NotificationService
+    depends_on:
+      - rabbitmq
+7. Build and Run the Solution
+Build Docker images:
+
+bash
+Copy
+Edit
+docker-compose build
+Start the services:
+
+bash
+Copy
+Edit
+docker-compose up
+Test the Order API:
+
+Use Postman or cURL:
+bash
+Copy
+Edit
+curl -X POST -H "Content-Type: application/json" -d '"Test Order"' http://localhost:5000/orders
+Verify that the Notification Service sends an email when an order is placed.
